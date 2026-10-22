@@ -37,16 +37,16 @@ func (s CircuitState) String() string {
 
 // CircuitBreaker implements the circuit breaker pattern for a single provider.
 type CircuitBreaker struct {
-	mu              sync.Mutex
-	providerID      string
-	state           CircuitState
-	failures        int
-	successes       int
-	halfOpenProbes  int
-	lastFailure     time.Time
-	cfg             config.CircuitBreakerConfig
-	codes           map[int]bool
-	onStateChange   func(string, bool) // providerID, healthy
+	mu             sync.Mutex
+	providerID     string
+	state          CircuitState
+	failures       int
+	successes      int
+	halfOpenProbes int
+	lastFailure    time.Time
+	cfg            config.CircuitBreakerConfig
+	codes          map[int]bool
+	onStateChange  func(string, bool) // providerID, healthy
 }
 
 // NewCircuitBreaker creates a circuit breaker for a provider.
