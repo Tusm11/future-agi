@@ -169,6 +169,7 @@ func (cb *CircuitBreaker) RecordFailure(err error) {
 			)
 			if cb.onStateChange != nil {
 				cb.onStateChange(cb.providerID, false)
+				cb.readmitAfterCooldown()
 			}
 		}
 	case StateHalfOpen:
@@ -184,6 +185,7 @@ func (cb *CircuitBreaker) RecordFailure(err error) {
 		)
 		if cb.onStateChange != nil {
 			cb.onStateChange(cb.providerID, false)
+			cb.readmitAfterCooldown()
 		}
 	}
 }
@@ -193,6 +195,13 @@ func (cb *CircuitBreaker) State() CircuitState {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	return cb.state
+}
+
+// readmitAfterCooldown puts the provider back into routing once the cooldown has passed. While
+// the circuit is open the router skips the provider, so no request would otherwise reach Allow
+// to move the circuit to half-open; Allow and the half-open probes decide from there.
+func (cb *CircuitBreaker) readmitAfterCooldown() {
+	time.AfterFunc(cb.cfg.Cooldown, func() { cb.onStateChange(cb.providerID, true) })
 }
 
 // isFailure checks if an error counts as a circuit breaker failure.
