@@ -2111,6 +2111,45 @@ func TestFailover_CircuitBreakerReadmitsProviderAfterCooldown(t *testing.T) {
 	}
 }
 
+// A half-open probe that gets an error the breaker ignores (a 400 the provider passed through)
+// must hand back its probe slot. If it leaks, Allow refuses every later request, so a model whose
+// only target is that provider answers "all providers ... unavailable" until a restart.
+func TestFailover_HalfOpenClientErrorDoesNotStrandProvider(t *testing.T) {
+	router := makeFailoverRouter(t, "gpt-4", "openai")
+	cbCfg := newTestCBConfig() // HalfOpenMaxProbes unset, so 1
+	cbReg := NewCircuitBreakerRegistry(cbCfg, router.SetHealthy)
+	f := NewFailover(config.FailoverConfig{Enabled: true, MaxAttempts: 3}, router, nil, cbReg)
+
+	reply := serverErr()
+	call := func(context.Context, string, string) error { return reply }
+
+	for i := 0; i < 20 && cbReg.Get("openai").State() != StateOpen; i++ {
+		f.Execute(context.Background(), "gpt-4", call)
+	}
+	if state := cbReg.Get("openai").State(); state != StateOpen {
+		t.Fatalf("openai circuit = %v after repeated failures, want open", state)
+	}
+
+	// After the cooldown openai is re-admitted and the next request is the half-open probe.
+	time.Sleep(cbCfg.Cooldown + 50*time.Millisecond)
+	reply = clientErr()
+	_, err := f.Execute(context.Background(), "gpt-4", call)
+	var apiErr *models.APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != 400 {
+		t.Fatalf("half-open probe: err = %v, want the provider's 400", err)
+	}
+
+	reply = nil
+	for i := 0; i < cbCfg.SuccessThreshold; i++ {
+		if _, err := f.Execute(context.Background(), "gpt-4", call); err != nil {
+			t.Fatalf("request %d after the probe got a 400: %v", i+1, err)
+		}
+	}
+	if state := cbReg.Get("openai").State(); state != StateClosed {
+		t.Errorf("openai circuit = %v after recovering, want closed", state)
+	}
+}
+
 // 12. TestCircuitBreaker_HalfOpenMaxProbes — gates concurrent probes in half-open state
 func TestCircuitBreaker_HalfOpenMaxProbes(t *testing.T) {
 	cfg := newTestCBConfig()
@@ -2222,6 +2261,41 @@ func TestCircuitBreaker_ProbeCounterDecrementOnSuccess(t *testing.T) {
 	// Now Allow() should succeed (slot freed up).
 	if !cb.Allow() {
 		t.Fatal("Allow() should succeed after probe succeeded and freed a slot")
+	}
+}
+
+// TestCircuitBreaker_HalfOpenNonBreakerErrorReleasesProbe — a half-open probe that ends in an
+// error the breaker ignores (a 400) still hands back its slot
+func TestCircuitBreaker_HalfOpenNonBreakerErrorReleasesProbe(t *testing.T) {
+	cfg := newTestCBConfig() // SuccessThreshold = 2
+	cfg.HalfOpenMaxProbes = 1
+	cb := NewCircuitBreaker("provider-1", cfg, nil)
+
+	for i := 0; i < cfg.FailureThreshold; i++ {
+		cb.RecordFailure(serverErr())
+	}
+	time.Sleep(cfg.Cooldown + 5*time.Millisecond)
+
+	// A 400 neither closes nor re-opens the circuit, and the probe's slot comes back.
+	if !cb.Allow() {
+		t.Fatal("Allow() after cooldown = false, want true")
+	}
+	cb.RecordFailure(clientErr())
+	if cb.State() != StateHalfOpen {
+		t.Fatalf("state after a probe got a 400 = %v, want %v", cb.State(), StateHalfOpen)
+	}
+	if !cb.Allow() {
+		t.Fatal("Allow() after a probe got a 400 = false, want true: the probe slot leaked")
+	}
+
+	// The same once a probe has succeeded and the circuit still needs one more success.
+	cb.RecordSuccess()
+	if !cb.Allow() {
+		t.Fatal("Allow() after a successful probe = false, want true")
+	}
+	cb.RecordFailure(clientErr())
+	if !cb.Allow() {
+		t.Fatal("Allow() after the second probe got a 400 = false, want true: the probe slot leaked")
 	}
 }
 
