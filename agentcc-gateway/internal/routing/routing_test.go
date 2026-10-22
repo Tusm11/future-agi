@@ -2197,36 +2197,55 @@ func TestCircuitBreaker_HalfOpenMaxProbes(t *testing.T) {
 	}
 }
 
-// 13. TestCircuitBreaker_ProbeCounterReset — counter resets when circuit closes
+// 13. TestCircuitBreaker_ProbeCounterReset — counter resets when circuit closes, so the next
+// half-open cycle gets the full probe budget
 func TestCircuitBreaker_ProbeCounterReset(t *testing.T) {
-	cfg := newTestCBConfig()
-	cfg.HalfOpenMaxProbes = 1
+	cfg := newTestCBConfig() // SuccessThreshold = 2
+	cfg.HalfOpenMaxProbes = 3
 	cb := NewCircuitBreaker("provider-1", cfg, nil)
 
-	// Open → half-open → closed cycle.
-	for i := 0; i < cfg.FailureThreshold; i++ {
-		cb.RecordFailure(serverErr())
+	trip := func() {
+		for i := 0; i < cfg.FailureThreshold; i++ {
+			cb.RecordFailure(serverErr())
+		}
+		if cb.State() != StateOpen {
+			t.Fatalf("state after %d failures = %v, want %v", cfg.FailureThreshold, cb.State(), StateOpen)
+		}
+		time.Sleep(cfg.Cooldown + 5*time.Millisecond)
 	}
 
-	time.Sleep(cfg.Cooldown + 5*time.Millisecond)
-
-	// First Allow() should succeed (counter increments).
-	if !cb.Allow() {
-		t.Fatal("first Allow() after cooldown should return true")
+	// Open → half-open: take every probe slot.
+	trip()
+	for i := 0; i < cfg.HalfOpenMaxProbes; i++ {
+		if !cb.Allow() {
+			t.Fatalf("Allow() #%d after cooldown = false, want true", i+1)
+		}
 	}
-
-	// Second Allow() should fail (counter at max).
 	if cb.Allow() {
-		t.Fatal("second Allow() should return false (counter at max)")
+		t.Fatal("Allow() past HalfOpenMaxProbes = true, want false")
 	}
 
-	// Record success to close the circuit.
-	cb.RecordSuccess()
-
-	// After closing, the probe counter should be reset.
-	// Try Allow() again—it should succeed because circuit is closed.
+	// SuccessThreshold probes succeed and close the circuit while one probe is still in flight.
+	for i := 0; i < cfg.SuccessThreshold; i++ {
+		cb.RecordSuccess()
+	}
+	if cb.State() != StateClosed {
+		t.Fatalf("state after %d successes = %v, want %v", cfg.SuccessThreshold, cb.State(), StateClosed)
+	}
 	if !cb.Allow() {
-		t.Fatal("Allow() should return true for closed circuit")
+		t.Fatal("Allow() = false for a closed circuit, want true")
+	}
+	cb.RecordSuccess() // the last probe finishes after the circuit closed
+
+	// Next cycle: the counter must start from zero, not from the probe left over above.
+	trip()
+	for i := 0; i < cfg.HalfOpenMaxProbes; i++ {
+		if !cb.Allow() {
+			t.Fatalf("Allow() #%d in the next half-open cycle = false, want true", i+1)
+		}
+	}
+	if cb.Allow() {
+		t.Fatal("Allow() past HalfOpenMaxProbes in the next cycle = true, want false")
 	}
 }
 
@@ -2296,6 +2315,38 @@ func TestCircuitBreaker_HalfOpenNonBreakerErrorReleasesProbe(t *testing.T) {
 	cb.RecordFailure(clientErr())
 	if !cb.Allow() {
 		t.Fatal("Allow() after the second probe got a 400 = false, want true: the probe slot leaked")
+	}
+}
+
+// TestCircuitBreaker_ReopenGivesNextCycleFullProbeBudget — a failed probe re-opens the circuit
+// while another probe is still in flight, and the next half-open cycle again admits
+// HalfOpenMaxProbes probes
+func TestCircuitBreaker_ReopenGivesNextCycleFullProbeBudget(t *testing.T) {
+	cfg := newTestCBConfig()
+	cfg.HalfOpenMaxProbes = 2
+	cb := NewCircuitBreaker("provider-1", cfg, nil)
+
+	for i := 0; i < cfg.FailureThreshold; i++ {
+		cb.RecordFailure(serverErr())
+	}
+	time.Sleep(cfg.Cooldown + 5*time.Millisecond)
+
+	if !cb.Allow() || !cb.Allow() {
+		t.Fatal("first two Allow() calls after cooldown should succeed")
+	}
+	cb.RecordFailure(serverErr()) // one probe fails; the other never reports back
+	if cb.State() != StateOpen {
+		t.Fatalf("state after a failed probe = %v, want %v", cb.State(), StateOpen)
+	}
+
+	time.Sleep(cfg.Cooldown + 5*time.Millisecond)
+	for i := 0; i < cfg.HalfOpenMaxProbes; i++ {
+		if !cb.Allow() {
+			t.Fatalf("Allow() #%d in the next half-open cycle = false, want true", i+1)
+		}
+	}
+	if cb.Allow() {
+		t.Fatal("Allow() past HalfOpenMaxProbes in the next cycle = true, want false")
 	}
 }
 
